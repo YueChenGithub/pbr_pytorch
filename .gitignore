@@ -1,3 +1,5 @@
 scenes/
-tests/compare_mi_blender/
+
 *.ply
+*.png
+*.mp4

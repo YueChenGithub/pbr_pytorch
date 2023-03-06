@@ -4,8 +4,13 @@ import math
 
 
 def create_mitsuba_scene(ply_path):
-    object_dict = {'type': 'obj',
-                   'filename': ply_path}
+    if ply_path[-3:] == 'obj':
+        object_dict = {'type': 'obj',
+                       'filename': ply_path}
+
+    if ply_path[-3:] == 'ply':
+        object_dict = {'type': 'ply',
+                       'filename': ply_path}
 
     scene_dict = {'type': 'scene',
                   'object': object_dict}
@@ -15,8 +20,11 @@ def create_mitsuba_scene(ply_path):
 def create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh):
     cam_transform_mat = np.array(list(cam_transform_mat.split(',')), dtype=float)  # str2array
     cam_transform_mat = cam_transform_mat.reshape(4, 4)
+
     cam_transform_mat = mi.ScalarTransform4f(cam_transform_mat) @ mi.ScalarTransform4f.scale(
         [-1, 1, -1])  # change coordinate from blender to mitsuba (flip x and z axis)
+    # cam_transform_mat = mi.ScalarTransform4f(cam_transform_mat)
+
 
     sensor_dict = {'type': 'perspective',
                    'to_world': cam_transform_mat,

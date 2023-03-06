@@ -52,7 +52,7 @@ def get_ao_image(cam_angle_x, cam_transform_mat, imh, imw, scene, spp):
     print(f"intersection time: {t1 - t0}")
     """ao parameters"""
     ambient_range = 0.75
-    ambient_ray_count = 256
+    ambient_ray_count = 1
     """integrator"""
     # Loop iteration counter
     i = mi.UInt32(0)
