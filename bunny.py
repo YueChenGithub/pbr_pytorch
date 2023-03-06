@@ -1,5 +1,7 @@
 import mitsuba as mi
 import drjit as dr
+import torch
+
 from sampling import visualize3dscatter
 mi.set_variant("cuda_ad_rgb")
 
@@ -48,14 +50,27 @@ emitter = scene.environment()
 #                          sample3=0,))  # A uniformly distributed sample on the domain [0,1]^2. For sensor endpoints, this argument determines the position on the aperture of the sensor.
 
 
-DirectionSample, Color = emitter.sample_direction(it=si,
+DirectionSample, L = emitter.sample_direction(it=si,
                                                   sample=sampler.next_2d(),
                                                   active=si.is_valid())
 
-wo = DirectionSample.p.torch().cpu()  # outgoing direction
-pdf = DirectionSample.pdf.torch().cpu()
+wo_world = DirectionSample.d.torch()  # outgoing direction
+pdf = DirectionSample.pdf.torch()
+wo_local = si.sh_frame.to_local(wo_world)
 
-wo_valid = wo[si.is_valid()]
-pdf_valid = pdf[si.is_valid()]
+cos_term = si.sh_frame.cos_theta(wo_local).torch()[:, None]  # [N,1]
+cos_term[~si.is_valid().torch().bool()] = torch.tensor([0], dtype=torch.float32).cuda()
+print(cos_term.min(), cos_term.max())
 
-visualize3dscatter(wo_valid[:,0], wo_valid[:,1], wo_valid[:,2])
+L = L.torch()
+print(L.min(), L.max())
+
+envmap = params['my_envmap.data'].torch()
+print(envmap.min(), envmap.max())
+
+
+
+# wo_valid = wo[si.is_valid()]
+# pdf_valid = pdf[si.is_valid()]
+#
+# visualize3dscatter(wo_valid[:,0], wo_valid[:,1], wo_valid[:,2])

@@ -148,7 +148,7 @@ def camera_intersect(scene, sensor, spp):
 
 
 def main():
-    expeirment = 'cube'
+    expeirment = 'lego'
     ply_path = get_ply_path(expeirment)
     envmap_path = get_light_probe_path(expeirment)
     inten = get_light_inten(expeirment)
@@ -168,13 +168,13 @@ def main():
 
         """rendering"""
         image_list = []
-        n = 1
+        n = 10
         for i in range(n):
             image = render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp)
             image_list.append(image)
         image = torch.mean(torch.stack(image_list), dim=0)
         # show_image(image)
-        save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}/{view}.png"
+        save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_cws/{view}.png"
         save_image(image, save_image_path)
 
 

@@ -2,6 +2,8 @@ import mitsuba as mi
 import numpy as np
 import math
 
+import torch
+
 
 def create_mitsuba_scene(ply_path):
     if ply_path[-3:] == 'obj':
@@ -39,3 +41,6 @@ def create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh):
     sensor = mi.load_dict(sensor_dict)
 
     return sensor
+
+def print_min_max(x:torch.Tensor):
+    print(x.min(), x.max())

@@ -12,8 +12,6 @@ mi.set_variant("cuda_ad_rgb")
 
 
 def create_mitsuba_scene_envmap(ply_path, envmap_path, inten):
-
-
     envmap_dict = {'type': 'envmap',
                    'filename': envmap_path,
                    'scale': inten,
@@ -24,7 +22,6 @@ def create_mitsuba_scene_envmap(ply_path, envmap_path, inten):
                    'filename': ply_path,
                    # 'face_normals': True  # todo check this
                    }
-
 
     scene_dict = {'type': 'scene',
                   'object': object_dict,
@@ -47,42 +44,47 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp):
     diffuse = diffuse / math.pi  # [N,3]
     diffuse = torch.clip(diffuse, 0, None)
 
-    # # visualize diffuse
-    # show_diffuse_image(diffuse, imh, imw, spp)
+    # Emitter sampling
+    DirectionSample, _ = emitter.sample_direction(it=si,
+                                                  sample=sampler.next_2d(),
+                                                  active=si.is_valid())
 
-    # BRDF Sampling
-    # todo below consider invalid si
-    wo_local = mi.warp.square_to_uniform_hemisphere(sampler.next_2d())
-    pdf = mi.warp.square_to_cosine_hemisphere_pdf(wo_local)
-    pdf = pdf.torch()[:, None]  # [N,1]
 
-    # print(pdf.min())
-    pdf = torch.clip(pdf, 1e-12, None)  # todo pdf can be negative sometimes?
-    # pdf = torch.abs(pdf)
+    wo_world = DirectionSample.d  # outgoing direction
+    pdf = DirectionSample.pdf.torch()[:, None]
+    wo_local = si.sh_frame.to_local(wo_world)
+    cos_term = si.sh_frame.cos_theta(wo_local).torch()[:, None]  # [N,1]
+    # cos_term[~si.is_valid().torch().bool()] = torch.tensor([0], dtype=torch.float32).cuda()
+    cos_term = torch.nan_to_num(cos_term, nan=0)
 
-    wo_world = si.sh_frame.to_world(wo_local)  # outgoing direction
+
+
+
+    # determine if the wo hits the object
     Epsilon = 1e-6
     wo_ray_world = mi.Ray3f(o=si.p + Epsilon * wo_world,
                             d=wo_world)  # move origin towards outgoing direction a little bit
-
-    # calculate intersection of outgoing ray and object
     si2 = scene.ray_intersect(wo_ray_world)
 
-    # evaluate environment light intensity for rays that did not hit object
     L = emitter.eval(si2, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
     L = L.torch()  # [N,3]
+
+
+
+    # mit.print_min_max(diffuse)
+    # mit.print_min_max(L)
+    # mit.print_min_max(cos_term)
+    # mit.print_min_max(pdf)
+
+    diffuse = torch.clip(diffuse, 0, None)
     L = torch.clip(L, 0, None)
-
+    cos_term = torch.clip(cos_term, 0, None)
+    pdf = torch.clip(pdf, 1e-6, None)
     # rendering equation
-    cos_term = si.sh_frame.cos_theta(wo_local).torch()[:, None]  # [N,1]
-    cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
     color = diffuse * L * cos_term / pdf  # [N, 3]
-
-    # color[~si.is_valid().torch().bool()] = torch.tensor([0,0,0], dtype=torch.float32).cuda()  # <- already exist in diffuse
 
     color = color.reshape(imh, imw, spp, 3)
     color = color.mean(axis=2)
-
 
     return color
 
@@ -148,7 +150,7 @@ def camera_intersect(scene, sensor, spp):
 
 
 def main():
-    expeirment = 'cube'
+    expeirment = 'lego'
     ply_path = get_ply_path(expeirment)
     envmap_path = get_light_probe_path(expeirment)
     inten = get_light_inten(expeirment)
@@ -168,13 +170,13 @@ def main():
 
         """rendering"""
         image_list = []
-        n = 1
+        n = 10
         for i in range(n):
             image = render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp)
             image_list.append(image)
         image = torch.mean(torch.stack(image_list), dim=0)
         # show_image(image)
-        save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}/{view}.png"
+        save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_ems/{view}.png"
         save_image(image, save_image_path)
 
 
