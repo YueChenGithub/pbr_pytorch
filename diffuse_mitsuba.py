@@ -52,22 +52,25 @@ def create_mitsuba_scene_envmap(ply_path, envmap_path, inten):
 def render(cam_angle_x, cam_transform_mat, imh, imw, scene):
     sensor = mit.create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh)
     Path_tracer_dict = {'type': 'path',
-                        'max_depth': 2}
+                        'max_depth': 2,
+                        'hide_emitters': True}
     Depth_integrator = {'type': 'depth'}
-    Direct_integrator = {'type': 'direct'}
-    integrator = mi.load_dict(Path_tracer_dict)
+    Direct_integrator = {'type': 'direct',
+                         'hide_emitters': True}
+    integrator = mi.load_dict(Direct_integrator)
     image = mi.render(scene, spp=128, sensor=sensor, integrator=integrator)
     return image
 
 
 def main():
-    expeirment = 'cube'
+    expeirment = 'cube_point'
     ply_path = get_ply_path(expeirment)
     envmap_path = get_light_probe_path(expeirment)
     inten = get_light_inten(expeirment)
+
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
 
-    for i in range(100):
+    for i in range(50):
         view = f"test_{i:03d}"
         metadata_path = f"./scenes/cube_rough/{view}/metadata.json"
         """read information"""

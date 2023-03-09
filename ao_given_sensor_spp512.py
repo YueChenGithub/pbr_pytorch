@@ -8,11 +8,25 @@ import torchvision
 import time
 
 mi.set_variant("cuda_ad_rgb")
+def create_mitsuba_scene(ply_path):
+    if ply_path[-3:] == 'obj':
+        object_dict = {'type': 'obj',
+                       'filename': ply_path,
+                       'face_normals': True
+                       }
 
+    if ply_path[-3:] == 'ply':
+        object_dict = {'type': 'ply',
+                       'filename': ply_path}
+
+    scene_dict = {'type': 'scene',
+                  'object': object_dict}
+    scene = mi.load_dict(scene_dict)
+    return scene
 
 def main():
-    ply_path = "./scenes/Cube_rough.obj"
-    scene = mit.create_mitsuba_scene(ply_path)
+    ply_path = "./scenes/cube_rough.obj"
+    scene = create_mitsuba_scene(ply_path)
     cam_transform_mat = "-0.9999999403953552,0.0,0.0,0.0,0.0,-0.7341099977493286,0.6790305972099304,2.737260103225708,0.0,0.6790306568145752,0.7341098785400391,2.959291696548462,0.0,0.0,0.0,1.0"
     cam_angle_x = 0.6911112070083618
     imw = 512
@@ -51,7 +65,7 @@ def get_ao_image(cam_angle_x, cam_transform_mat, imh, imw, scene, spp):
     t1 = time.time()
     print(f"intersection time: {t1 - t0}")
     """ao parameters"""
-    ambient_range = 0.75
+    ambient_range = 10000
     ambient_ray_count = 1
     """integrator"""
     # Loop iteration counter

@@ -9,7 +9,7 @@ import time
 mi.set_variant("cuda_ad_rgb")
 
 if __name__ == '__main__':
-    ply_path = "./scenes/Cube_rough.obj"
+    ply_path = "./scenes/cube_rough.obj"
     scene = mit.create_mitsuba_scene(ply_path)
 
     """camera initialization"""

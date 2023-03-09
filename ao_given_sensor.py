@@ -10,7 +10,7 @@ import time
 mi.set_variant("cuda_ad_rgb")
 
 if __name__ == '__main__':
-    ply_path = "./scenes/cube.ply"
+    ply_path = "./scenes/cube_rough.obj"
     scene = mit.create_mitsuba_scene(ply_path)
 
     cam_transform_mat = "-0.9999999403953552,0.0,0.0,0.0,0.0,-0.7341099977493286,0.6790305972099304,2.737260103225708,0.0,0.6790306568145752,0.7341098785400391,2.959291696548462,0.0,0.0,0.0,1.0"

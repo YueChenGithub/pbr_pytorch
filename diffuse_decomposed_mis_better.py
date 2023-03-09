@@ -8,10 +8,13 @@ import json
 import math
 from path_tool import get_ply_path, get_light_probe_path, get_light_inten
 import matplotlib.pyplot as plt
+
 mi.set_variant("cuda_ad_rgb")
 
 
 def create_mitsuba_scene_envmap(ply_path, envmap_path, inten):
+
+
     envmap_dict = {'type': 'envmap',
                    'filename': envmap_path,
                    'scale': inten,
@@ -22,6 +25,7 @@ def create_mitsuba_scene_envmap(ply_path, envmap_path, inten):
                    'filename': ply_path,
                    'face_normals': True  # todo check this
                    }
+
 
     scene_dict = {'type': 'scene',
                   'object': object_dict,
@@ -48,53 +52,100 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     # # visualize diffuse
     # show_diffuse_image(diffuse, imh, imw, spp)
 
-    # Sampling incident direction using cos-weighted sampling (diffuse sampling)
-    # todo below consider invalid si to save calculation?
-    wi_local = mi.warp.square_to_cosine_hemisphere(sampler.next_2d())
-    pdf = mi.warp.square_to_cosine_hemisphere_pdf(wi_local)
-    pdf = pdf.torch()[:, None]  # [N,1]
-    if debug:
-        mit.print_min_max(pdf)
-    pdf = torch.clip(pdf, 0, None)  # todo pdf can be negative sometimes? Should we clip it like this?
+    L_cws, cos_term_cws, pdf_cws = cws(emitter, sampler, scene, si)
+    L_ems, cos_term_ems, pdf_ems = ems(emitter, sampler, scene, si)
 
-    # transform local incident direction to world coordinate
-    wi_world = si.sh_frame.to_world(wi_local)  # outgoing direction
-
-    #  Spawn incident rays at the surface interactions towards incident direction
-    ray_i = si.spawn_ray(wi_world)
-
-    # calculate intersection of incident rays and object
-    si2 = scene.ray_intersect(ray_i, active=si.is_valid())  # reject invalid ray_i
-
-    # evaluate environment light intensity for rays that did not hit object
-    L = emitter.eval(si2, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
-    L = L.torch()  # [N,3]
-    L = torch.clip(L, 0, None)  # todo can be negative in some hdr envmap
-
-    # calculate the cos term
-    cos_term = si.sh_frame.cos_theta(wi_local).torch()[:, None]  # [N,1]
-    cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
+    # the power heuristic with beta = 2
+    beta = 2  # fixme: beta increases, the output will be darker
+    w_cws = torch.pow(pdf_cws, beta-1) / (torch.pow(pdf_cws, beta) + torch.pow(pdf_ems, beta))
+    w_ems = torch.pow(pdf_ems, beta-1) / (torch.pow(pdf_cws, beta) + torch.pow(pdf_ems, beta))
 
     # rendering equation
-    color = diffuse * L * cos_term / pdf  # [N, 3]
+    color_cws = w_cws * diffuse * L_cws * cos_term_cws
+    color_ems = w_ems * diffuse * L_ems * cos_term_ems
+    color = color_cws + color_ems
 
     # pdf can be zero => color can be inf
     color = torch.nan_to_num(color, nan=0)
 
     if debug:
+        mit.print_min_max(w_cws)
+        mit.print_min_max(w_ems)
+
+        # visualization
         length = color.shape[0]
         num = 100000
         index = torch.randint(0, length, (num,))
+
         points = color.sum(dim=1).cpu()
         print(points.shape)
         plt.plot(points[index])
         plt.show()
 
+        # w = w.cpu()
+        # print(w.shape)
+        # plt.plot(w[index])
+        # plt.show()
+
     # take average over spp
     color = color.reshape(imh, imw, spp, 3)
+
+
+
+
     color = color.mean(axis=2)  # [imh, imw, 3]
 
+
+
     return color
+
+
+def ems(emitter, sampler, scene, si):
+    # Sampling incident direction using emitter sampling
+    DirectionSample, _ = emitter.sample_direction(it=si,
+                                                  sample=sampler.next_2d(),
+                                                  active=si.is_valid())
+    wi_world = DirectionSample.d  # incident direction
+    pdf = DirectionSample.pdf.torch()[:, None]
+    pdf = torch.clip(pdf, 0, None)
+    # transform global incident direction to local frame
+    wi_local = si.sh_frame.to_local(wi_world)
+    #  Spawn incident rays at the surface interactions towards incident direction
+    ray_i = si.spawn_ray(wi_world)
+    # calculate intersection of incident rays and object
+    si2 = scene.ray_intersect(ray_i, active=si.is_valid())  # reject invalid ray_i
+    # evaluate environment light intensity for rays that did not hit object
+    L = emitter.eval(si2, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
+    L = L.torch()  # [N,3]
+    L = torch.clip(L, 0, None)  # todo can be negative in some hdr envmap
+    # calculate the cos term
+    cos_term = si.sh_frame.cos_theta(wi_local).torch()[:, None]  # [N,1]
+    cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
+    cos_term = torch.nan_to_num(cos_term, nan=0)  # todo sometimes got nan
+    return L, cos_term, pdf
+
+
+def cws(emitter, sampler, scene, si):
+    # Sampling incident direction using cos-weighted sampling (diffuse sampling)
+    # todo below consider invalid si to save calculation?
+    wi_local = mi.warp.square_to_cosine_hemisphere(sampler.next_2d())
+    pdf = mi.warp.square_to_cosine_hemisphere_pdf(wi_local)
+    pdf = pdf.torch()[:, None]  # [N,1]
+    pdf = torch.clip(pdf, 0, None)  # todo pdf can be negative sometimes? Should we clip it like this?
+    # transform local incident direction to world coordinate
+    wi_world = si.sh_frame.to_world(wi_local)  # outgoing direction
+    #  Spawn incident rays at the surface interactions towards incident direction
+    ray_i = si.spawn_ray(wi_world)
+    # calculate intersection of incident rays and object
+    si2 = scene.ray_intersect(ray_i, active=si.is_valid())  # reject invalid ray_i
+    # evaluate environment light intensity for rays that did not hit object
+    L = emitter.eval(si2, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
+    L = L.torch()  # [N,3]
+    L = torch.clip(L, 0, None)  # todo can be negative in some hdr envmap
+    # calculate the cos term
+    cos_term = si.sh_frame.cos_theta(wi_local).torch()[:, None]  # [N,1]
+    cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
+    return L, cos_term, pdf
 
 
 def show_diffuse_image(diffuse, imh, imw, spp):
@@ -190,10 +241,9 @@ def main():
             image = render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug)
             image_list.append(image)
         image = torch.mean(torch.stack(image_list), dim=0)
-
         # show_image(image)
         if not debug:
-            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_cws/{view}.png"
+            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_mis_power/{view}.png"
             save_image(image, save_image_path)
 
 
