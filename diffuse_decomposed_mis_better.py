@@ -59,6 +59,7 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     beta = 2  # fixme: beta increases, the output will be darker
     w_cws = torch.pow(pdf_cws, beta-1) / (torch.pow(pdf_cws, beta) + torch.pow(pdf_ems, beta))
     w_ems = torch.pow(pdf_ems, beta-1) / (torch.pow(pdf_cws, beta) + torch.pow(pdf_ems, beta))
+    print(w_cws.max())
 
     # rendering equation
     color_cws = w_cws * diffuse * L_cws * cos_term_cws
@@ -68,29 +69,8 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     # pdf can be zero => color can be inf
     color = torch.nan_to_num(color, nan=0)
 
-    if debug:
-        mit.print_min_max(w_cws)
-        mit.print_min_max(w_ems)
-
-        # visualization
-        length = color.shape[0]
-        num = 100000
-        index = torch.randint(0, length, (num,))
-
-        points = color.sum(dim=1).cpu()
-        print(points.shape)
-        plt.plot(points[index])
-        plt.show()
-
-        # w = w.cpu()
-        # print(w.shape)
-        # plt.plot(w[index])
-        # plt.show()
-
     # take average over spp
     color = color.reshape(imh, imw, spp, 3)
-
-
 
 
     color = color.mean(axis=2)  # [imh, imw, 3]
@@ -107,7 +87,7 @@ def ems(emitter, sampler, scene, si):
                                                   active=si.is_valid())
     wi_world = DirectionSample.d  # incident direction
     pdf = DirectionSample.pdf.torch()[:, None]
-    pdf = torch.clip(pdf, 0, None)
+    pdf = torch.clip(pdf, 1e-4, None)
     # transform global incident direction to local frame
     wi_local = si.sh_frame.to_local(wi_world)
     #  Spawn incident rays at the surface interactions towards incident direction
@@ -120,8 +100,8 @@ def ems(emitter, sampler, scene, si):
     L = torch.clip(L, 0, None)  # todo can be negative in some hdr envmap
     # calculate the cos term
     cos_term = si.sh_frame.cos_theta(wi_local).torch()[:, None]  # [N,1]
-    cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
     cos_term = torch.nan_to_num(cos_term, nan=0)  # todo sometimes got nan
+    cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
     return L, cos_term, pdf
 
 
@@ -131,7 +111,7 @@ def cws(emitter, sampler, scene, si):
     wi_local = mi.warp.square_to_cosine_hemisphere(sampler.next_2d())
     pdf = mi.warp.square_to_cosine_hemisphere_pdf(wi_local)
     pdf = pdf.torch()[:, None]  # [N,1]
-    pdf = torch.clip(pdf, 0, None)  # todo pdf can be negative sometimes? Should we clip it like this?
+    pdf = torch.clip(pdf, 1e-4, None)  # todo pdf can be negative sometimes? Should we clip it like this?
     # transform local incident direction to world coordinate
     wi_world = si.sh_frame.to_world(wi_local)  # outgoing direction
     #  Spawn incident rays at the surface interactions towards incident direction

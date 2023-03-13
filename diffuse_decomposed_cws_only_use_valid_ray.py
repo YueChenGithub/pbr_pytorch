@@ -35,7 +35,7 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     sensor = mit.create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh)
 
     # calculate surface intersection of rays shooting from camera
-    si, sampler = camera_intersect(scene, sensor, spp)
+    si, sampler, indices_ray = camera_intersect(scene, sensor, spp)
 
     # # visualize normal and intersection mask
     # show_normal_mask_image(imh, imw, si, spp)
@@ -91,7 +91,13 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
         plt.show()
 
     # take average over spp
-    color = color.reshape(imh, imw, spp, 3)
+    only_use_valid_ray = True
+    if only_use_valid_ray:
+        color_entire = torch.zeros(imh * imw * spp, 3, dtype=torch.float32).cuda()
+        color_entire[indices_ray, :] = color
+        color = color_entire.reshape(imh, imw, spp, 3)
+    else:
+        color = color.reshape(imh, imw, spp, 3)
     color = color.mean(axis=2)  # [imh, imw, 3]
 
     return color
@@ -151,10 +157,40 @@ def camera_intersect(scene, sensor, spp):
         sample3=0
         # A uniformly distributed sample on the domain [0,1]^2. This argument determines the position on the aperture of the sensor.
     )
+
+    only_use_valid_ray = True
+    if only_use_valid_ray:
+        # remove invalid ray to reduce memory
+        # select pixels that contain object
+        mask_hit = scene.ray_test(rays).torch().bool()
+        mask_hit = mask_hit.reshape(-1, spp)  # [imh*imw, spp]
+        mask_hit = mask_hit.sum(dim=1)  # [imh*imw]
+        indices_pixel_valid = (mask_hit > 0).nonzero().reshape(-1)  # len = N_valid
+        print(indices_pixel_valid)
+
+        # select ray
+        indices_list = []
+        for i in range(spp):
+            indices_list.append(indices_pixel_valid * spp + i)
+        indices_ray = torch.stack(indices_list)
+        indices_ray = indices_ray.T.reshape(-1)  # len = N_valid * spp
+        # indices_ray = indices_ray[0:1000000]
+
+        # create new ray
+        ray_o = rays.o.torch()
+        ray_d = rays.d.torch()
+        ray_o_selected = ray_o[indices_ray, :]
+        ray_d_selected = ray_d[indices_ray, :]
+        rays = mi.Ray3f(ray_o_selected, ray_d_selected)
+
+        # adjust sampler that generate N_valid * spp random numbers
+        sampler.seed(torch.randint(0, 10000, (1,)).item(), len(indices_ray))
+
     """find intersection"""
     si = scene.ray_intersect(rays)
+    print(si.p.torch().shape)
 
-    return si, sampler
+    return si, sampler, indices_ray
 
 
 def main():
@@ -164,8 +200,8 @@ def main():
     inten = get_light_inten(expeirment)
     # inten = 1
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
-    spp = 64
-    debug = True
+    spp = 128
+    debug = False
 
     if debug:
         n = 1
@@ -191,7 +227,7 @@ def main():
             image_list.append(image)
         image = torch.mean(torch.stack(image_list), dim=0)
 
-        show_image(image)
+        # show_image(image)
         if not debug:
             save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_cws/{view}.png"
             save_image(image, save_image_path)
