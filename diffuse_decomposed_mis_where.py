@@ -55,8 +55,8 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     L_cws, cos_term_cws, pdf_cws = cws(emitter, sampler, scene, si)
     L_ems, cos_term_ems, pdf_ems = ems(emitter, sampler, scene, si)
 
-    # the power heuristic with beta = 2
-    beta = 2  # fixme: beta increases, the output will be darker
+    # the balance heuristic with beta = 1
+    beta = 1  # fixme: beta increases, the output will be darker
     w_cws = torch.pow(pdf_cws, beta - 1) / (torch.pow(pdf_cws, beta) + torch.pow(pdf_ems, beta))
     w_ems = torch.pow(pdf_ems, beta - 1) / (torch.pow(pdf_cws, beta) + torch.pow(pdf_ems, beta))
 
@@ -135,6 +135,7 @@ def cws(emitter, sampler, scene, si):
     cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
     return L, cos_term, pdf
 
+
 def show_diffuse_image(diffuse, imh, imw, spp):
     color = diffuse.reshape(imh, imw, spp, 3)
     color = torch.mean(color, dim=2)
@@ -204,7 +205,6 @@ def main():
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
     spp = 128
     debug = False
-
     if debug:
         n = 1
     else:
@@ -230,7 +230,7 @@ def main():
         image = torch.mean(torch.stack(image_list), dim=0)
         # show_image(image)
         if not debug:
-            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_mis_power/{view}.png"
+            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_mis/{view}.png"
             save_image(image, save_image_path)
 
 
