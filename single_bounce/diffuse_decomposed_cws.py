@@ -37,27 +37,28 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     # calculate surface intersection of rays shooting from camera
     si, sampler = camera_intersect(scene, sensor, spp)
 
+    # # visualize normal and intersection mask
+    # show_normal_mask_image(imh, imw, si, spp)
 
     # query diffuse color of the intersection
-    diffuse = eval_diffuse_trivial(si)
+    diffuse = eval_diffuse_trivial(si)  # contains info about si => invalid si has diffuse zero
     diffuse = diffuse / math.pi  # [N,3]
     diffuse = torch.clip(diffuse, 0, None)
 
-    # Sampling incident direction using emitter sampling
-    DirectionSample, _ = emitter.sample_direction(it=si,
-                                                  sample=sampler.next_2d(),
-                                                  active=si.is_valid())
+    # # visualize diffuse
+    # show_diffuse_image(diffuse, imh, imw, spp)
 
-
-    wi_world = DirectionSample.d  # incident direction
-    pdf = DirectionSample.pdf.torch()[:, None]
+    # Sampling incident direction using cos-weighted sampling (diffuse sampling)
+    # todo below consider invalid si to save calculation?
+    wi_local = mi.warp.square_to_cosine_hemisphere(sampler.next_2d())
+    pdf = mi.warp.square_to_cosine_hemisphere_pdf(wi_local)
+    pdf = pdf.torch()[:, None]  # [N,1]
     if debug:
         mit.print_min_max(pdf)
-    pdf = torch.clip(pdf, 0, None)
+    pdf = torch.clip(pdf, 0, None)  # todo pdf can be negative sometimes? Should we clip it like this?
 
-    # transform global incident direction to local frame
-    wi_local = si.sh_frame.to_local(wi_world)
-
+    # transform local incident direction to world coordinate
+    wi_world = si.sh_frame.to_world(wi_local)  # outgoing direction
 
     #  Spawn incident rays at the surface interactions towards incident direction
     ray_i = si.spawn_ray(wi_world)
@@ -69,69 +70,29 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     L = emitter.eval(si2, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
     L = L.torch()  # [N,3]
     L = torch.clip(L, 0, None)  # todo can be negative in some hdr envmap
-    if debug:
-        print(torch.unique(L, return_counts=True))
-
-
-    def emitter_eval(si, emitter, active):
-
-        params = mi.traverse(emitter)
-        data = params['data'].torch()
-        scale = params['scale'].torch()
-        to_world = params['to_world']
-        active = active.torch().bool()
-
-        v = to_world.inverse().transform_affine(-si.wi)
-
-        u = (dr.atan2(v.x, -v.z) / (2*math.pi)).torch()
-        v = (dr.safe_acos(v.y) / math.pi).torch()
-
-        u[u < 0] = u[u < 0] + 1
-
-        res = [data.shape[1], data.shape[0]]
-        u = torch.floor(u * res[0]).long()
-        v = torch.floor(v * res[0]).long()
-        u = torch.clip(u, None, res[0] - 1)
-        v = torch.clip(v, None, res[1] - 1)
-
-        output = data[v, u, :3] * scale
-        output[~active, :] = 0
-        return output
-
-
-    L = emitter_eval(si2, emitter, active=~si2.is_valid())
-    L = torch.clip(L, 0, None)
-    if debug:
-        print(torch.unique(L, return_counts=True))
 
     # calculate the cos term
     cos_term = si.sh_frame.cos_theta(wi_local).torch()[:, None]  # [N,1]
     cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
-    cos_term = torch.nan_to_num(cos_term, nan=0)  # todo sometimes got nan
 
     # rendering equation
     color = diffuse * L * cos_term / pdf  # [N, 3]
-    # if debug:
-    #     mit.print_min_max(color)
 
     # pdf can be zero => color can be inf
     color = torch.nan_to_num(color, nan=0)
 
-    # if debug:
-    #     length = color.shape[0]
-    #     num = 100000
-    #     index = torch.randint(0, length, (num,))
-    #     points = color.sum(dim=1).cpu()
-    #     print(points.shape)
-    #     plt.plot(points[index])
-    #     plt.show()
-    #
-    #     # w = 1/pdf.cpu()
-    #     # plt.plot(w[index])
-    #     # plt.show()
+    if debug:
+        length = color.shape[0]
+        num = 100000
+        index = torch.randint(0, length, (num,))
+        points = color.sum(dim=1).cpu()
+        print(points.shape)
+        plt.plot(points[index])
+        plt.show()
 
+    # take average over spp
     color = color.reshape(imh, imw, spp, 3)
-    color = color.mean(axis=2)
+    color = color.mean(axis=2)  # [imh, imw, 3]
 
     return color
 
@@ -201,15 +162,15 @@ def main():
     ply_path = get_ply_path(expeirment)
     envmap_path = get_light_probe_path(expeirment)
     inten = get_light_inten(expeirment)
-
+    # inten = 1
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
-    spp = 128
+    spp = 64
     debug = True
 
     if debug:
         n = 1
     else:
-        n = 200
+        n = 50
 
     for i in range(n):
         view = f"test_{i:03d}"
@@ -230,11 +191,10 @@ def main():
             image_list.append(image)
         image = torch.mean(torch.stack(image_list), dim=0)
 
+        show_image(image)
         if not debug:
-            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_ems/{view}.png"
+            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_cws/{view}.png"
             save_image(image, save_image_path)
-        else:
-            show_image(image)
 
 
 if __name__ == '__main__':

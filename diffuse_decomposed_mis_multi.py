@@ -8,10 +8,13 @@ import json
 import math
 from path_tool import get_ply_path, get_light_probe_path, get_light_inten
 import matplotlib.pyplot as plt
+
 mi.set_variant("cuda_ad_rgb")
 
 
 def create_mitsuba_scene_envmap(ply_path, envmap_path, inten):
+
+
     envmap_dict = {'type': 'envmap',
                    'filename': envmap_path,
                    'scale': inten,
@@ -22,6 +25,7 @@ def create_mitsuba_scene_envmap(ply_path, envmap_path, inten):
                    'filename': ply_path,
                    'face_normals': True  # todo check this
                    }
+
 
     scene_dict = {'type': 'scene',
                   'object': object_dict,
@@ -34,57 +38,145 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     emitter = scene.emitters()[0]
     sensor = mit.create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh)
 
-    '''first bounce'''
-
     # calculate surface intersection of rays shooting from camera
     si, sampler = camera_intersect(scene, sensor, spp)
 
-    # query diffuse color of the intersection
-    diffuse = eval_diffuse_trivial(si)  # contains info about si => invalid si has diffuse zero
-    diffuse = diffuse / math.pi  # [N,3]
-    diffuse = torch.clip(diffuse, 0, None)
+    global bounce
+    bounce = 2
 
-    # Sampling incident direction using cos-weighted sampling (diffuse sampling)
-    wi_local = mi.warp.square_to_cosine_hemisphere(sampler.next_2d())
-    pdf = mi.warp.square_to_cosine_hemisphere_pdf(wi_local).torch()
-    pdf = torch.clip(pdf, 0, None)
-    w = 1 / pdf
-    w[pdf == 0] = 0
-    w = w[:, None]  # [N,1]
+    L_cws1, color_ems1, w1, si2 = mis(emitter, sampler, scene, si)
+    L_cws2, color_ems2, w2, si3 = mis(emitter, sampler, scene, si2)
 
-    # transform local incident direction to world coordinate
-    wi_world = si.sh_frame.to_world(wi_local)  # outgoing direction
+    L = L_cws1 + (w2 * L_cws2 + color_ems2)
 
-    #  Spawn incident rays at the surface interactions towards incident direction
-    ray_i = si.spawn_ray(wi_world)
-
-    # calculate intersection of incident rays and object
-    si2 = scene.ray_intersect(ray_i, active=si.is_valid())  # reject invalid ray_i
-
-    # evaluate environment light intensity for rays that did not hit object
-    L = emitter.eval(si2, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
-    L = L.torch()  # [N,3]
-
-
-    # calculate the cos term
-    cos_term = si.sh_frame.cos_theta(wi_local).torch()[:, None]  # [N,1]
-    cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
-
-    # rendering equation
-    color = diffuse * L * cos_term * w  # [N, 3]
-
-    # pdf can be zero => color can be inf
-    color = torch.nan_to_num(color, nan=0)
+    color = w1 * L + color_ems1
 
 
     # take average over spp
     color = color.reshape(imh, imw, spp, 3)
+
+
     color = color.mean(axis=2)  # [imh, imw, 3]
 
 
-
-
     return color
+
+
+def mis(emitter, sampler, scene, si):
+    # query diffuse color of the intersection
+    diffuse = eval_diffuse_trivial(si)  # contains info about si => invalid si has diffuse zero
+    diffuse = diffuse / math.pi  # [N,3]
+    diffuse = torch.clip(diffuse, 0, None)
+    L_cws, cos_term_cws, pdf_cws, si2 = cws(emitter, sampler, scene, si)
+    L_ems, cos_term_ems, pdf_ems = ems(emitter, sampler, scene, si)
+    # the balance heuristic with beta = 1
+    w_cws = torch.pow(pdf_cws, beta - 1) / (torch.pow(pdf_cws, beta) + torch.pow(pdf_ems, beta))
+    w_ems = torch.pow(pdf_ems, beta - 1) / (torch.pow(pdf_cws, beta) + torch.pow(pdf_ems, beta))
+    w_cws = torch.where(pdf_cws > 1e-8, w_cws, 0)
+    w_ems = torch.where(pdf_ems > 1e-8, w_ems, 0)
+    # rendering equation
+    color_ems = w_ems * diffuse * L_ems * cos_term_ems
+    return L_cws, color_ems, cos_term_cws*diffuse*w_cws, si2
+
+
+def ems(emitter, sampler, scene, si):
+    # Sampling incident direction using emitter sampling
+    DirectionSample, _ = emitter.sample_direction(it=si,
+                                                  sample=sampler.next_2d(),
+                                                  active=si.is_valid())
+    wi_world = DirectionSample.d  # incident direction
+    pdf = DirectionSample.pdf.torch()[:, None]
+    pdf = torch.clip(pdf, 0, None)
+    # transform global incident direction to local frame
+    wi_local = si.sh_frame.to_local(wi_world)
+    #  Spawn incident rays at the surface interactions towards incident direction
+    ray_i = si.spawn_ray(wi_world)
+    # calculate intersection of incident rays and object
+    si2 = scene.ray_intersect(ray_i, active=si.is_valid())  # reject invalid ray_i
+    # evaluate environment light intensity for rays that did not hit object
+    # L = eval(si2, emitter, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
+    L = emitter.eval(si2, active=~si2.is_valid()).torch()
+    L = torch.clip(L, 0, None)  # todo can be negative in some hdr envmap
+    # calculate the cos term
+    cos_term = si.sh_frame.cos_theta(wi_local).torch()[:, None]  # [N,1]
+    cos_term = torch.nan_to_num(cos_term, nan=0)  # todo sometimes got nan
+    cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
+    return L, cos_term, pdf
+
+
+def cws(emitter, sampler, scene, si):
+    # Sampling incident direction using cos-weighted sampling (diffuse sampling)
+    # todo below consider invalid si to save calculation?
+    wi_local = mi.warp.square_to_cosine_hemisphere(sampler.next_2d())
+    pdf = mi.warp.square_to_cosine_hemisphere_pdf(wi_local)
+    pdf = pdf.torch()[:, None]  # [N,1]
+    pdf = torch.clip(pdf, 0, None)  # todo pdf can be negative sometimes? Should we clip it like this?
+    # transform local incident direction to world coordinate
+    wi_world = si.sh_frame.to_world(wi_local)  # outgoing direction
+    #  Spawn incident rays at the surface interactions towards incident direction
+    ray_i = si.spawn_ray(wi_world)
+    # calculate intersection of incident rays and object
+    si2 = scene.ray_intersect(ray_i, active=si.is_valid())  # reject invalid ray_i
+    # evaluate environment light intensity for rays that did not hit object
+    # L = eval(si2, emitter, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
+    L = emitter.eval(si2, active=~si2.is_valid()).torch()
+    L = torch.clip(L, 0, None)  # todo can be negative in some hdr envmap
+    # calculate the cos term
+    cos_term = si.sh_frame.cos_theta(wi_local).torch()[:, None]  # [N,1]
+    cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
+    return L, cos_term, pdf, si2
+
+
+def eval(si, emitter, active):
+    active = active.torch().bool()
+    v = emitter.world_transform().inverse().transform_affine(-si.wi)
+    uv = mi.Point2f(dr.atan2(v.x, -v.z) / (2*math.pi), dr.safe_acos(v.y) / math.pi)
+    params = mi.traverse(emitter)
+    data = params['data'].torch()  # [imh, imw+1, 3]
+    res = mi.Vector2u(data.shape[1], data.shape[0])  # [imw+1, imh]
+
+    scale = params['scale'].torch()
+
+    uv.x -= .5 / (res.x - 1)
+
+    uv -= dr.floor(uv)
+    uv *= mi.Vector2f(res - 1)
+    pos = dr.minimum(mi.Point2u(uv), res - 2)
+
+    w1 = uv - mi.Point2f(pos)
+    w0 = 1. - w1
+    width = res.x
+    index = dr.fma(pos.y, width, pos.x)
+
+    width = mi.Int64(width).torch()
+    index = mi.Int64(index).torch()
+
+    data = data.reshape(-1, data.shape[-1])
+
+    v00 = gather(data, index, active)
+    v10 = gather(data, index + 1, active)
+    v01 = gather(data, index + width, active)
+    v11 = gather(data, index + width + 1, active)
+
+    w0x = w0.x.torch()[:, None]
+    w0y = w0.y.torch()[:, None]
+    w1x = w1.x.torch()[:, None]
+    w1y = w1.y.torch()[:, None]
+
+    v0 = w0x * v00 + w1x * v10
+    v1 = w0x * v01 + w1x * v11
+
+    v = w0y * v0 + w1y * v1
+
+    output = v * scale
+
+    return output
+
+
+def gather(data, index, active):
+    v = data[index, :3]
+    v[~active,:] = 0
+    return v
 
 
 
@@ -134,9 +226,13 @@ def main():
     ply_path = get_ply_path(expeirment)
     envmap_path = get_light_probe_path(expeirment)
     inten = get_light_inten(expeirment)
+    # inten = 1
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
     spp = 128
     debug = True
+
+    global beta  # fixme: beta increases, the output will be darker
+    beta = 2
 
     if debug:
         n = 1
@@ -163,7 +259,7 @@ def main():
         image = torch.mean(torch.stack(image_list), dim=0)
 
         if not debug:
-            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_cws/{view}.png"
+            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_mis_beta{beta}_bounce{bounce}/{view}.png"
             save_image(image, save_image_path)
         else:
             show_image(image)

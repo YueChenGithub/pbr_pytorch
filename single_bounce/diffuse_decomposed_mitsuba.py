@@ -40,7 +40,7 @@ def create_mitsuba_scene_envmap(ply_path, envmap_path, inten):
 
 def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     # Class member:
-    m_max_depth = 2
+    m_max_depth = 10
     m_hide_emitters = mi.Mask(True)
     m_rr_depth = 10000
 
@@ -74,7 +74,6 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
         if dr.any(dr.neq(si.emitter(scene), None)):  # if any si located in emitter
             ds = mi.DirectionSample3f(scene, si, prev_si)
             em_pdf = 0.
-
             if dr.any(~prev_bsdf_delta):  # if any prev_bsdf_delta is False  # todo what is delta?
                 em_pdf = scene.pdf_emitter_direction(prev_si, ds, active=~prev_bsdf_delta)
 
@@ -84,7 +83,7 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
 
             '''Accumulate, being careful with polarization (see spec_fma)'''
             result = spec_fma(throughput, ds.emitter.eval(si, prev_bsdf_pdf > 0.) * mis_bsdf, result)
-
+            print(torch.unique(throughput.torch()))
 
         '''Continue tracing the path at this point?'''
         active_next = (depth + 1 < m_max_depth) & si.is_valid()
@@ -127,7 +126,7 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
 
         '''---------------------- BSDF sampling ----------------------'''
         bsdf_weight = si.to_world_mueller(bsdf_weight, -bsdf_sample.wo, si.wi)
-        ray = si.spawn_ray(si.to_world(bsdf_sample.wo))
+        ray = si.spawn_ray(si.to_world(bsdf_sample.wo))si
 
         '''------ Update loop variables based on current interaction ------'''
         throughput *= bsdf_weight
@@ -201,14 +200,14 @@ def generate_camera_rays(scene, sensor, spp):
 
 
 def main():
-    expeirment = 'lego'
+    expeirment = 'cube'
     ply_path = get_ply_path(expeirment)
     envmap_path = get_light_probe_path(expeirment)
     inten = get_light_inten(expeirment)
     # inten = 1
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
     spp = 128
-    debug = False
+    debug = True
 
     if debug:
         n = 1
@@ -237,10 +236,12 @@ def main():
             image_list.append(image)
         image = torch.mean(torch.stack(image_list), dim=0)
 
-        # show_image(image)
+
         if not debug:
             save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_mitsuba/{view}.png"
             save_image(image, save_image_path)
+        else:
+            show_image(image)
 
 
 if __name__ == '__main__':

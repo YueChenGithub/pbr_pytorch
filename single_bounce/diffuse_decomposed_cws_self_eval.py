@@ -34,20 +34,25 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     emitter = scene.emitters()[0]
     sensor = mit.create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh)
 
-    '''first bounce'''
-
     # calculate surface intersection of rays shooting from camera
     si, sampler = camera_intersect(scene, sensor, spp)
+
+    # # visualize normal and intersection mask
+    # show_normal_mask_image(imh, imw, si, spp)
 
     # query diffuse color of the intersection
     diffuse = eval_diffuse_trivial(si)  # contains info about si => invalid si has diffuse zero
     diffuse = diffuse / math.pi  # [N,3]
     diffuse = torch.clip(diffuse, 0, None)
 
+    # # visualize diffuse
+    # show_diffuse_image(diffuse, imh, imw, spp)
+
     # Sampling incident direction using cos-weighted sampling (diffuse sampling)
+    # todo below consider invalid si to save calculation?
     wi_local = mi.warp.square_to_cosine_hemisphere(sampler.next_2d())
     pdf = mi.warp.square_to_cosine_hemisphere_pdf(wi_local).torch()
-    pdf = torch.clip(pdf, 0, None)
+    pdf = torch.clip(pdf, 0, None)  # todo check
     w = 1 / pdf
     w[pdf == 0] = 0
     w = w[:, None]  # [N,1]
@@ -61,10 +66,94 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     # calculate intersection of incident rays and object
     si2 = scene.ray_intersect(ray_i, active=si.is_valid())  # reject invalid ray_i
 
-    # evaluate environment light intensity for rays that did not hit object
-    L = emitter.eval(si2, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
-    L = L.torch()  # [N,3]
+    # # evaluate environment light intensity for rays that did not hit object
+    # L = emitter.eval(si2, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
+    # L = L.torch()  # [N,3]
+    # if debug:
+    #     print(torch.unique(L, return_counts=True))
 
+    '''here begin our evaluation function'''
+    def eval(si, emitter, active):
+        active = active.torch().bool()
+        v = emitter.world_transform().inverse().transform_affine(-si.wi)
+        uv = mi.Point2f(dr.atan2(v.x, -v.z) / (2*math.pi), dr.safe_acos(v.y) / math.pi)
+        params = mi.traverse(emitter)
+        data = params['data'].torch()  # [imh, imw+1, 3]
+        res = mi.Vector2u(data.shape[1], data.shape[0])  # [imw+1, imh]
+
+        scale = params['scale'].torch()
+
+        uv.x -= .5 / (res.x - 1)
+
+        uv -= dr.floor(uv)
+        uv *= mi.Vector2f(res - 1)
+        pos = dr.minimum(mi.Point2u(uv), res - 2)
+
+        w1 = uv - mi.Point2f(pos)
+        w0 = 1. - w1
+        width = res.x
+        index = dr.fma(pos.y, width, pos.x)
+
+        width = mi.Int64(width).torch()
+        index = mi.Int64(index).torch()
+
+        data = data.reshape(-1, data.shape[-1])
+
+        v00 = gather(data, index, active)
+        v10 = gather(data, index + 1, active)
+        v01 = gather(data, index + width, active)
+        v11 = gather(data, index + width + 1, active)
+
+        w0x = w0.x.torch()[:, None]
+        w0y = w0.y.torch()[:, None]
+        w1x = w1.x.torch()[:, None]
+        w1y = w1.y.torch()[:, None]
+
+        v0 = w0x * v00 + w1x * v10
+        v1 = w0x * v01 + w1x * v11
+
+        v = w0y * v0 + w1y * v1
+
+        output = v * scale
+
+        return output
+
+
+    def gather(data, index, active):
+        v = data[index, :3]
+        v[~active,:] = 0
+        return v
+    #
+    # def emitter_eval(si, emitter, active):
+    #
+    #     params = mi.traverse(emitter)
+    #     data = params['data'].torch()
+    #     scale = params['scale'].torch()
+    #     to_world = params['to_world']
+    #     active = active.torch().bool()
+    #
+    #     v = to_world.inverse().transform_affine(-si.wi)
+    #
+    #     u = (dr.atan2(v.x, -v.z) / (2*math.pi)).torch()
+    #     v = (dr.safe_acos(v.y) / math.pi).torch()
+    #
+    #     u[u < 0] = u[u < 0] + 1
+    #
+    #     res = [data.shape[1], data.shape[0]]
+    #     u = torch.floor(u * res[0]).long()
+    #     v = torch.floor(v * res[0]).long()
+    #     u = torch.clip(u, None, res[0] - 1)
+    #     v = torch.clip(v, None, res[1] - 1)
+    #
+    #     output = data[v, u, :3] * scale
+    #     output[~active, :] = 0
+    #     return output
+
+
+    L = eval(si2, emitter, active=~si2.is_valid())
+    L = torch.clip(L, 0, None)  # todo can be negative in some hdr envmap
+    # if debug:
+    #     print(torch.unique(L, return_counts=True))
 
     # calculate the cos term
     cos_term = si.sh_frame.cos_theta(wi_local).torch()[:, None]  # [N,1]
@@ -81,11 +170,13 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     color = color.reshape(imh, imw, spp, 3)
     color = color.mean(axis=2)  # [imh, imw, 3]
 
-
-
-
     return color
 
+
+def show_diffuse_image(diffuse, imh, imw, spp):
+    color = diffuse.reshape(imh, imw, spp, 3)
+    color = torch.mean(color, dim=2)
+    show_image(color)
 
 
 def eval_diffuse_trivial(si: mi.Interaction3f):
@@ -97,6 +188,19 @@ def eval_diffuse_trivial(si: mi.Interaction3f):
     color[mask] = torch.tensor([0.8, 0.8, 0.8], dtype=torch.float32).cuda()
     return color
 
+
+def show_normal_mask_image(imh, imw, si, spp):
+    mask = si.is_valid()
+    result = dr.select(mask, si.n, [0, 0, 0])
+    normal = result.torch()
+    normal = normal.reshape(imh, imw, spp, 3)
+    normal = normal.mean(axis=2)  # average over spp
+    normal = torch.clip(normal, 0, 1)  # todo it is correct?
+    mask = mask.torch().byte() * 255
+    mask = mask.reshape(imh, imw, spp)
+    mask, _ = torch.max(mask, axis=2, keepdim=True)  # If any camera ray intersects with the object, mask = 1
+    show_image(normal)
+    show_image(mask)
 
 
 def camera_intersect(scene, sensor, spp):
@@ -136,7 +240,7 @@ def main():
     inten = get_light_inten(expeirment)
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
     spp = 128
-    debug = True
+    debug = False
 
     if debug:
         n = 1

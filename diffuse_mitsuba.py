@@ -52,25 +52,27 @@ def create_mitsuba_scene_envmap(ply_path, envmap_path, inten):
 def render(cam_angle_x, cam_transform_mat, imh, imw, scene):
     sensor = mit.create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh)
     Path_tracer_dict = {'type': 'path',
-                        'max_depth': 2,
+                        'max_depth': bounce+1,
                         'hide_emitters': True}
     Depth_integrator = {'type': 'depth'}
     Direct_integrator = {'type': 'direct',
                          'hide_emitters': True}
-    integrator = mi.load_dict(Direct_integrator)
+    integrator = mi.load_dict(Path_tracer_dict)
     image = mi.render(scene, spp=128, sensor=sensor, integrator=integrator)
     return image
 
 
 def main():
-    expeirment = 'cube_point'
+    expeirment = 'cube'
     ply_path = get_ply_path(expeirment)
     envmap_path = get_light_probe_path(expeirment)
     inten = get_light_inten(expeirment)
 
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
+    global bounce
+    bounce = 5
 
-    for i in range(50):
+    for i in range(200):
         view = f"test_{i:03d}"
         metadata_path = f"./scenes/cube_rough/{view}/metadata.json"
         """read information"""
@@ -83,7 +85,7 @@ def main():
 
         """rendering"""
         image = render(cam_angle_x, cam_transform_mat, imh, imw, scene)
-        save_image_path = f"./tests/diffuse_mitsuba/{expeirment}/{view}.png"
+        save_image_path = f"./tests/diffuse_mitsuba/{expeirment}_bounce{bounce}/{view}.png"
         save_image(image, save_image_path)
 
 
