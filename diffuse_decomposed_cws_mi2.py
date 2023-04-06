@@ -61,9 +61,30 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     # calculate intersection of incident rays and object
     si2 = scene.ray_intersect(ray_i, active=si.is_valid())  # reject invalid ray_i
 
+
+
+
+
+
+    params = mi.traverse(scene)
+    key = 'emitter.data'
+    dr.enable_grad(params[key])
     # evaluate environment light intensity for rays that did not hit object
     L = emitter.eval(si2, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
-    L = L.torch()  # [N,3]
+
+    tensor = dr.zeros(mi.TensorXf, shape=(3, 1))
+    tensor[0] = L.x
+    tensor[1] = L.y
+    tensor[2] = L.z
+
+
+    loss = dr.sum(L)
+    dr.backward(loss)
+    print(dr.grad(params[key]).torch())
+
+
+
+
 
 
     # calculate the cos term
@@ -80,6 +101,8 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     # take average over spp
     color = color.reshape(imh, imw, spp, 3)
     color = color.mean(axis=2)  # [imh, imw, 3]
+    #
+
 
 
 
@@ -136,7 +159,7 @@ def main():
     inten = get_light_inten(expeirment)
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
     spp = 128
-    debug = False
+    debug = True
 
     if debug:
         n = 1

@@ -18,16 +18,9 @@ def create_mitsuba_scene_envmap(ply_path, envmap_path, inten):
                    'to_world': mi.ScalarTransform4f.rotate(axis=[0, 0, 1], angle=90) @
                                mi.ScalarTransform4f.rotate(axis=[1, 0, 0], angle=90)}
 
-    bsdf_dict = {'type': 'diffuse',
-                 'reflectance': {
-                     'type': 'rgb',
-                     'value': [0.8, 0.8, 0.8]
-                 }}
-
     object_dict = {'type': 'obj',
                    'filename': ply_path,
-                   'face_normals': True,  # todo check this
-                   'bsdf': bsdf_dict  # todo implement this part
+                   'face_normals': True  # todo check this
                    }
 
     scene_dict = {'type': 'scene',
@@ -41,27 +34,98 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     emitter = scene.emitters()[0]
     sensor = mit.create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh)
 
+    '''first bounce'''
+
     # calculate surface intersection of rays shooting from camera
     si, sampler = camera_intersect(scene, sensor, spp)
 
-    bsdf = si.bsdf()
+    # query diffuse color of the intersection
+    diffuse = eval_diffuse_trivial(si)  # contains info about si => invalid si has diffuse zero
+    diffuse = diffuse / math.pi  # [N,3]
+    diffuse = torch.clip(diffuse, 0, None)
+
+    # Sampling incident direction using cos-weighted sampling (diffuse sampling)
+    wi_local = mi.warp.square_to_cosine_hemisphere(sampler.next_2d())
+    pdf = mi.warp.square_to_cosine_hemisphere_pdf(wi_local).torch()
+    pdf = torch.clip(pdf, 0, None)
+    w = 1 / pdf
+    w[pdf == 0] = 0
+    w = w[:, None]  # [N,1]
+
+    # transform local incident direction to world coordinate
+    wi_world = si.sh_frame.to_world(wi_local)  # outgoing direction
+
+    #  Spawn incident rays at the surface interactions towards incident direction
+    ray_i = si.spawn_ray(wi_world)
+
+    # calculate intersection of incident rays and object
+    si2 = scene.ray_intersect(ray_i, active=si.is_valid())  # reject invalid ray_i
+
+    # evaluate environment light intensity for rays that did not hit object
+    # L = emitter.eval(si2, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
+
+
+
+    # @dr.wrap_ad(source='torch', target='drjit')
+    # def emitter_eval(_env_map):
+    #     return _env_map*2
+
+    params = mi.traverse(scene)
+    key = 'emitter.data'
+    env_map_gt = params[key].torch()
+    env_map = torch.ones_like(env_map_gt, requires_grad=True)
+    L = emitter_eval(env_map, scene, emitter, si2)
+
+    print(L.shape)
+    L = torch.permute(L, (1, 0))
+    L = torch.clip(L, 0, None)
+
+
+    # calculate the cos term
+    cos_term = si.sh_frame.cos_theta(wi_local).torch()[:, None]  # [N,1]
+    cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
+
+    # rendering equation
+    color = diffuse * L * cos_term * w  # [N, 3]
+
+    # pdf can be zero => color can be inf
+    color = torch.nan_to_num(color, nan=0)
+
+
+    # take average over spp
+    color = color.reshape(imh, imw, spp, 3)
+    color = color.mean(axis=2)  # [imh, imw, 3]
+    #
+
+
+
+
+
+    return color
+
+@dr.wrap_ad(source='torch', target='drjit')
+def emitter_eval(_env_map, scene, emitter, si2):
+    _params = mi.traverse(scene)
+    _key = 'emitter.data'
+    _params[_key] = _env_map
+    _params.update()
+    _L = emitter.eval(si2, active=~si2.is_valid())
+    tensor = dr.zeros(mi.TensorXf, shape=dr.shape(_L))
+    tensor[0] = _L.x
+    tensor[1] = _L.y
+    tensor[2] = _L.z
+    return tensor
+
+
+
+def eval_diffuse_trivial(si: mi.Interaction3f):
     mask = si.is_valid().torch().bool()
-    valid = mask.nonzero().reshape(-1)
-    bsdf_valid = bsdf[int(valid[0])]
+    p = si.p.torch()
 
-    print(dir(bsdf))
-
-    print(type(si.is_valid()))
-
-
-
-
-    '''Sample'''
-
-
-
-
-    return 0
+    # return RGB value [1,1,1] for each valid point
+    color = torch.zeros_like(p)
+    color[mask] = torch.tensor([0.8, 0.8, 0.8], dtype=torch.float32).cuda()
+    return color
 
 
 
@@ -100,15 +164,14 @@ def main():
     ply_path = get_ply_path(expeirment)
     envmap_path = get_light_probe_path(expeirment)
     inten = get_light_inten(expeirment)
-    # inten = 1
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
-    spp = 128
-    debug = True
+    spp = 16
+    debug = False
 
     if debug:
         n = 1
     else:
-        n = 50
+        n = 200
 
     for i in range(n):
         view = f"test_{i:03d}"
@@ -127,12 +190,13 @@ def main():
         for i in range(n):
             image = render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug)
             image_list.append(image)
-        # image = torch.mean(torch.stack(image_list), dim=0)
+        image = torch.mean(torch.stack(image_list), dim=0)
 
-        # show_image(image)
         if not debug:
-            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_cws/{view}.png"
+            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_cws_mi/{view}.png"
             save_image(image, save_image_path)
+        else:
+            show_image(image)
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@ import json
 import math
 from path_tool import get_ply_path, get_light_probe_path, get_light_inten
 import matplotlib.pyplot as plt
+from brdf import Diffuse
 mi.set_variant("cuda_ad_rgb")
 
 
@@ -34,58 +35,52 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     emitter = scene.emitters()[0]
     sensor = mit.create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh)
 
-    '''first bounce'''
-
     # calculate surface intersection of rays shooting from camera
     si, sampler = camera_intersect(scene, sensor, spp)
 
-    # query diffuse color of the intersection
-    diffuse = eval_diffuse_trivial(si)  # contains info about si => invalid si has diffuse zero
-    diffuse = diffuse / math.pi  # [N,3]
-    diffuse = torch.clip(diffuse, 0, None)
+    global bounce
+    bounce = 5
 
-    # Sampling incident direction using cos-weighted sampling (diffuse sampling)
-    wi_local = mi.warp.square_to_cosine_hemisphere(sampler.next_2d())
-    pdf = mi.warp.square_to_cosine_hemisphere_pdf(wi_local).torch()
-    pdf = torch.clip(pdf, 0, None)
-    w = 1 / pdf
-    w[pdf == 0] = 0
-    w = w[:, None]  # [N,1]
-
-    # transform local incident direction to world coordinate
-    wi_world = si.sh_frame.to_world(wi_local)  # outgoing direction
-
-    #  Spawn incident rays at the surface interactions towards incident direction
-    ray_i = si.spawn_ray(wi_world)
-
-    # calculate intersection of incident rays and object
-    si2 = scene.ray_intersect(ray_i, active=si.is_valid())  # reject invalid ray_i
-
-    # evaluate environment light intensity for rays that did not hit object
-    L = emitter.eval(si2, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
-    L = L.torch()  # [N,3]
+    prev_w = 1
+    color = 0
+    # start a loop for each bounce
+    for i in range(bounce):
+        L, w, si = cws(emitter, sampler, scene, si)
+        prev_w = prev_w * w
+        color = color + prev_w * L
 
 
-    # calculate the cos term
-    cos_term = si.sh_frame.cos_theta(wi_local).torch()[:, None]  # [N,1]
-    cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
-
-    # rendering equation
-    color = diffuse * L * cos_term * w  # [N, 3]
 
     # pdf can be zero => color can be inf
     color = torch.nan_to_num(color, nan=0)
-
 
     # take average over spp
     color = color.reshape(imh, imw, spp, 3)
     color = color.mean(axis=2)  # [imh, imw, 3]
 
-
-
-
     return color
 
+
+
+
+def cws(emitter, sampler, scene, si):
+    # query diffuse color of the intersection
+    diffuse = eval_diffuse_trivial(si)
+
+    # sample incident direction
+    brdf = Diffuse(diffuse, si, sampler)
+    w, wi_world, _ = brdf.sample()
+
+    # create incident rays
+    ray_i = si.spawn_ray(wi_world)
+
+    # calculate surface intersection of incident rays
+    si2 = scene.ray_intersect(ray_i, active=si.is_valid())  # reject invalid ray_i
+
+    # calculate radiance
+    L = emitter.eval(si2, active=~si2.is_valid())
+    L = L.torch()  # [N,3]
+    return L, w, si2
 
 
 def eval_diffuse_trivial(si: mi.Interaction3f):
@@ -96,7 +91,6 @@ def eval_diffuse_trivial(si: mi.Interaction3f):
     color = torch.zeros_like(p)
     color[mask] = torch.tensor([0.8, 0.8, 0.8], dtype=torch.float32).cuda()
     return color
-
 
 
 def camera_intersect(scene, sensor, spp):
@@ -163,7 +157,7 @@ def main():
         image = torch.mean(torch.stack(image_list), dim=0)
 
         if not debug:
-            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_cws/{view}.png"
+            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_cws_bounce{bounce}_brdf/{view}.png"
             save_image(image, save_image_path)
         else:
             show_image(image)
