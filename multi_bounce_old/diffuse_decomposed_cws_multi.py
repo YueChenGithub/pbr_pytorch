@@ -8,8 +8,6 @@ import json
 import math
 from path_tool import get_ply_path, get_light_probe_path, get_light_inten
 import matplotlib.pyplot as plt
-from bsdf_diffuse3 import BSDF_Diffuse, Diffuse_MLP_trivial, Diffuse_Model
-import copy
 
 mi.set_variant("cuda_ad_rgb")
 
@@ -21,16 +19,9 @@ def create_mitsuba_scene_envmap(ply_path, envmap_path, inten):
                    'to_world': mi.ScalarTransform4f.rotate(axis=[0, 0, 1], angle=90) @
                                mi.ScalarTransform4f.rotate(axis=[1, 0, 0], angle=90)}
 
-    bsdf_dict = {'type': 'diffuse',
-                 'reflectance': {
-                     'type': 'rgb',
-                     'value': [0.8, 0.8, 0.8]
-                 }}
-
     object_dict = {'type': 'obj',
                    'filename': ply_path,
-                   'face_normals': True,  # todo check this
-                   # 'bsdf': bsdf_dict  # todo implement this part
+                   'face_normals': True  # todo check this
                    }
 
     scene_dict = {'type': 'scene',
@@ -40,79 +31,74 @@ def create_mitsuba_scene_envmap(ply_path, envmap_path, inten):
     return scene
 
 
-@dr.wrap_ad(source='torch', target='drjit')
-def emitter_eval(emitter, si, active=mi.Mask(True)):
-    L = emitter.eval(si, active=~si.is_valid() & active)
-    tensor = dr.zeros(mi.TensorXf, shape=dr.shape(L))
-    tensor[0] = L.x
-    tensor[1] = L.y
-    tensor[2] = L.z
-    return tensor
-
-
 def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
-    sensor = mit.create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh)
     emitter = scene.emitters()[0]
-    ray, sampler = generate_camera_rays(scene, sensor, spp)
+    sensor = mit.create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh)
 
-    diffuse_mlp = Diffuse_MLP_trivial()
-    diffuse_model = Diffuse_Model(diffuse_mlp)
-    bsdf = BSDF_Diffuse(diffuse_model)
+    '''first bounce'''
 
-    N_rays = dr.shape(ray.o)[1]
-    result = torch.zeros((N_rays, 3), dtype=torch.float32, device='cuda')  # todo
-    si = scene.ray_intersect(ray)
+    # calculate surface intersection of rays shooting from camera
+    si, sampler = camera_intersect(scene, sensor, spp)
 
-    brdf_multiplier_accum = 1
-    max_bounce = 3
-    for bounce in range(max_bounce):
-        # cws
-        L, brdf_multiplier, si = cws(bsdf, emitter, sampler, scene, si)
-        result = brdf_multiplier_accum * brdf_multiplier * L + result
+    global bounce
+    bounce = 2
 
-        # update
-        brdf_multiplier_accum = brdf_multiplier_accum * brdf_multiplier
+    L1, w1, si2 = cws(emitter, sampler, scene, si)
+    L2, w2, si3 = cws(emitter, sampler, scene, si2)
 
-    return result
+    L = L1 + L2 * w2
 
+    # rendering equation
+    color = L * w1  # [N, 3]
 
-def cws(bsdf, emitter, sampler, scene, si):
-    sample1 = sampler.next_1d()
-    sample2 = sampler.next_2d()
-    wo_local, brdf_multiplier, pdf = bsdf.sample(si, sample1, sample2)
-    wo_world = si.sh_frame.to_world(wo_local)
-    #  Spawn incident rays
-    ray_o = si.spawn_ray(wo_world)
-    si2 = scene.ray_intersect(ray_o, active=si.is_valid())  # reject invalid ray_i
-    L = emitter.eval(si2, active=~si2.is_valid()).torch()
-    L = torch.clip(L, 0, None)
-    return L, brdf_multiplier, si2
+    # pdf can be zero => color can be inf
+    color = torch.nan_to_num(color, nan=0)
+
+    # take average over spp
+    color = color.reshape(imh, imw, spp, 3)
+    color = color.mean(axis=2)  # [imh, imw, 3]
+
+    return color
 
 
-@dr.wrap_ad(source='torch', target='drjit')
-def emitter_eval(emitter, si):
-    L = emitter.eval(si, active=~si.is_valid())
-    tensor = dr.zeros(mi.TensorXf, shape=dr.shape(L))
-    tensor[0] = L.x
-    tensor[1] = L.y
-    tensor[2] = L.z
-    return tensor
+def cws(emitter, sampler, scene, si):
+    # query diffuse color of the intersection
+    diffuse = eval_diffuse_trivial(si)  # contains info about si => invalid si has diffuse zero
+    diffuse = diffuse / math.pi  # [N,3]
+    diffuse = torch.clip(diffuse, 0, None)
+    # Sampling incident direction using cos-weighted sampling (diffuse sampling)
+    wi_local = mi.warp.square_to_cosine_hemisphere(sampler.next_2d())
+    pdf = mi.warp.square_to_cosine_hemisphere_pdf(wi_local).torch()
+    pdf = torch.clip(pdf, 0, None)
+    w = 1 / pdf
+    w[pdf == 0] = 0
+    w = w[:, None]  # [N,1]
+    # transform local incident direction to world coordinate
+    wi_world = si.sh_frame.to_world(wi_local)  # outgoing direction
+    #  Spawn incident rays at the surface interactions towards incident direction
+    ray_i = si.spawn_ray(wi_world)
+    # calculate intersection of incident rays and object
+    si2 = scene.ray_intersect(ray_i, active=si.is_valid())  # reject invalid ray_i
+    # evaluate environment light intensity for rays that did not hit object
+    L = emitter.eval(si2, active=~si2.is_valid())  # Attention: did not work for mitsuba constant env map
+    L = L.torch()  # [N,3]
+    # calculate the cos term
+    cos_term = si.sh_frame.cos_theta(wi_local).torch()[:, None]  # [N,1]
+    cos_term = torch.clip(cos_term, 0, None)  # consider only the upper hemisphere
+    return L, cos_term * diffuse * w, si2
 
 
-def print_result(result, spp):
-    result = result.reshape(512, 512, spp, 3)
-    result = result.mean(dim=2)
-    show_image(result)
+def eval_diffuse_trivial(si: mi.Interaction3f):
+    mask = si.is_valid().torch().bool()
+    p = si.p.torch()
+
+    # return RGB value [1,1,1] for each valid point
+    color = torch.zeros_like(p)
+    color[mask] = torch.tensor([0.8, 0.8, 0.8], dtype=torch.float32).cuda()
+    return color
 
 
-def mis_weight(pdf_a: torch.Tensor, pdf_b: torch.Tensor):  # power heuristic
-    pdf_a = pdf_a * pdf_a
-    pdf_b = pdf_b * pdf_b
-    w = pdf_a / (pdf_a + pdf_b)
-    return torch.where(pdf_a == 0, 0, w)
-
-
-def generate_camera_rays(scene, sensor, spp):
+def camera_intersect(scene, sensor, spp):
     """create rays shooting from the camera"""
     film = sensor.film()
     sampler = sensor.sampler()
@@ -136,8 +122,10 @@ def generate_camera_rays(scene, sensor, spp):
         sample3=0
         # A uniformly distributed sample on the domain [0,1]^2. This argument determines the position on the aperture of the sensor.
     )
+    """find intersection"""
+    si = scene.ray_intersect(rays)
 
-    return rays, sampler
+    return si, sampler
 
 
 def main():
@@ -145,7 +133,6 @@ def main():
     ply_path = get_ply_path(expeirment)
     envmap_path = get_light_probe_path(expeirment)
     inten = get_light_inten(expeirment)
-    # inten = 1
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
     spp = 128
     debug = True
@@ -171,14 +158,11 @@ def main():
         n = 1
         for i in range(n):
             image = render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug)
-            # image = image.torch()
-            image = image.reshape(512, 512, spp, 3)
-            image = image.mean(dim=2)
             image_list.append(image)
         image = torch.mean(torch.stack(image_list), dim=0)
 
         if not debug:
-            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_mis/{view}.png"
+            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_{n}_cws_bounce{bounce}/{view}.png"
             save_image(image, save_image_path)
         else:
             show_image(image)

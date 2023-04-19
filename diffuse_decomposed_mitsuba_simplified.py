@@ -8,7 +8,7 @@ import json
 import math
 from path_tool import get_ply_path, get_light_probe_path, get_light_inten
 import matplotlib.pyplot as plt
-from bsdf_diffuse3 import BSDF_Diffuse, Diffuse_MLP_trivial, Diffuse_Model
+from bsdf_diffuse import Diffuse, Diffuse_model_trivial
 import copy
 
 mi.set_variant("cuda_ad_rgb")
@@ -50,53 +50,87 @@ def emitter_eval(emitter, si, active=mi.Mask(True)):
     return tensor
 
 
+@dr.wrap_ad(source='torch', target='drjit')
+def sample_emitter_direction(scene, si, sampler, active=mi.Mask(True)):
+    ds, em_weight = scene.sample_emitter_direction(si, sampler.next_2d(), True, active=active)
+    tensor = dr.zeros(mi.TensorXf, shape=dr.shape(em_weight))
+    tensor[0] = em_weight.x
+    tensor[1] = em_weight.y
+    tensor[2] = em_weight.z
+    return ds, tensor
+
+
 def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
+    # Input parameters
     sensor = mit.create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh)
     emitter = scene.emitters()[0]
     ray, sampler = generate_camera_rays(scene, sensor, spp)
 
-    diffuse_mlp = Diffuse_MLP_trivial()
-    diffuse_model = Diffuse_Model(diffuse_mlp)
-    bsdf = BSDF_Diffuse(diffuse_model)
+    m_max_depth = 4
+    active = mi.Mask(True)
 
-    N_rays = dr.shape(ray.o)[1]
-    result = torch.zeros((N_rays, 3), dtype=torch.float32, device='cuda')  # todo
-    si = scene.ray_intersect(ray)
+    if m_max_depth < 1: return {0.}
 
-    brdf_multiplier_accum = 1
-    max_bounce = 3
-    for bounce in range(max_bounce):
-        # cws
-        L, brdf_multiplier, si = cws(bsdf, emitter, sampler, scene, si)
-        result = brdf_multiplier_accum * brdf_multiplier * L + result
+    throughput = torch.tensor([1], dtype=torch.float32, device='cuda')
+    result = torch.zeros((imh * imw * spp, 3), dtype=torch.float32, device='cuda')
+    depth = mi.UInt32(0)
 
-        # update
-        brdf_multiplier_accum = brdf_multiplier_accum * brdf_multiplier
+    prev_si = dr.zeros(mi.Interaction3f)
+    prev_bsdf_pdf = mi.Float(1.)
+    diffuse_model_trivial = Diffuse_model_trivial()
+
+    while (1):
+        si = scene.ray_intersect(ray, active)
+
+        '''---------------------- Direct emission ----------------------'''
+        if dr.all(depth == 0):  # not include background
+            pass
+        else:
+            ds = mi.DirectionSample3f(scene, si, prev_si)
+            em_pdf = scene.pdf_emitter_direction(prev_si, ds, active=active)
+            mis_bsdf = mis_weight(prev_bsdf_pdf.torch(), em_pdf.torch())
+            L = emitter_eval(emitter, si, active=((prev_bsdf_pdf > 0) & active))
+            L = torch.permute(L, (1, 0))  # [N, 3]
+            result = throughput * L * mis_bsdf[:, None] + result
+
+
+        '''-------------------- Stopping criterion ---------------------'''
+        # Continue tracing the path at this point?
+        active_next = (depth + 1 < m_max_depth) & si.is_valid()
+        if dr.all(~active_next):
+            break  # check if all active_next are negative
+
+
+        '''---------------------- Emitter sampling ----------------------'''
+        bsdf = Diffuse(diffuse_model_trivial)
+        active_em = active_next & mi.Mask(True)  # always smooth
+        # Sample the emitter
+        ds, em_weight = sample_emitter_direction(scene, si, sampler, active=active_em & active)
+        em_weight = torch.permute(em_weight, (1, 0))  # [N, 3]
+        active_em &= dr.neq(ds.pdf, 0.)
+        wo = si.to_local(ds.d)
+
+        '''------ Evaluate BSDF * cos(theta) and sample direction -------'''
+        sample_1 = sampler.next_1d()
+        sample_2 = sampler.next_2d()
+        bsdf_val, bsdf_pdf, bsdf_sample, bsdf_weight = bsdf.eval_pdf_sample(si, wo, sample_1, sample_2, active=active)
+        '''--------------- Emitter sampling contribution ----------------'''
+        if dr.any(active_em):
+            mis_em = mis_weight(ds.pdf.torch(), bsdf_pdf)
+            result[active_em.torch().bool()] = (throughput * bsdf_val * em_weight * mis_em[:, None] + result)[
+                active_em.torch().bool()]
+
+        '''---------------------- BSDF sampling ----------------------'''
+        ray = si.spawn_ray(si.to_world(bsdf_sample.wo))
+
+        '''------ Update loop variables based on current interaction ------'''
+        throughput = throughput * bsdf_weight
+        prev_si = si
+        prev_bsdf_pdf = bsdf_sample.pdf
+        depth[si.is_valid()] += 1
+        active = active_next
 
     return result
-
-
-def cws(bsdf, emitter, sampler, scene, si):
-    sample1 = sampler.next_1d()
-    sample2 = sampler.next_2d()
-    wo_local, brdf_multiplier, pdf = bsdf.sample(si, sample1, sample2)
-    wo_world = si.sh_frame.to_world(wo_local)
-    #  Spawn incident rays
-    ray_o = si.spawn_ray(wo_world)
-    si2 = scene.ray_intersect(ray_o, active=si.is_valid())  # reject invalid ray_i
-    L = emitter.eval(si2, active=~si2.is_valid()).torch()
-    L = torch.clip(L, 0, None)
-    return L, brdf_multiplier, si2
-
-
-@dr.wrap_ad(source='torch', target='drjit')
-def emitter_eval(emitter, si):
-    L = emitter.eval(si, active=~si.is_valid())
-    tensor = dr.zeros(mi.TensorXf, shape=dr.shape(L))
-    tensor[0] = L.x
-    tensor[1] = L.y
-    tensor[2] = L.z
-    return tensor
 
 
 def print_result(result, spp):
@@ -147,7 +181,7 @@ def main():
     inten = get_light_inten(expeirment)
     # inten = 1
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
-    spp = 128
+    spp = 64
     debug = True
 
     if debug:
@@ -178,7 +212,7 @@ def main():
         image = torch.mean(torch.stack(image_list), dim=0)
 
         if not debug:
-            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_mis/{view}.png"
+            save_image_path = f"./tests/diffuse_decomposed/{expeirment}_mis_single/{view}.png"
             save_image(image, save_image_path)
         else:
             show_image(image)

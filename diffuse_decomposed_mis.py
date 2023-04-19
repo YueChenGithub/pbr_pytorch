@@ -8,7 +8,7 @@ import json
 import math
 from path_tool import get_ply_path, get_light_probe_path, get_light_inten
 import matplotlib.pyplot as plt
-from bsdf_diffuse3 import BSDF_Diffuse, Diffuse_MLP_trivial, Diffuse_Model
+from bsdf_diffuse2 import BSDF_Diffuse, Diffuse_MLP_trivial, Diffuse_Model
 import copy
 
 mi.set_variant("cuda_ad_rgb")
@@ -51,6 +51,7 @@ def emitter_eval(emitter, si, active=mi.Mask(True)):
 
 
 def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
+    # Input parameters
     sensor = mit.create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh)
     emitter = scene.emitters()[0]
     ray, sampler = generate_camera_rays(scene, sensor, spp)
@@ -58,35 +59,71 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
     diffuse_mlp = Diffuse_MLP_trivial()
     diffuse_model = Diffuse_Model(diffuse_mlp)
     bsdf = BSDF_Diffuse(diffuse_model)
+    throughput = torch.tensor([1], dtype=torch.float32, device='cuda')
+    active = mi.Mask(True)
 
     N_rays = dr.shape(ray.o)[1]
     result = torch.zeros((N_rays, 3), dtype=torch.float32, device='cuda')  # todo
-    si = scene.ray_intersect(ray)
 
-    brdf_multiplier_accum = 1
-    max_bounce = 3
-    for bounce in range(max_bounce):
-        # cws
-        L, brdf_multiplier, si = cws(bsdf, emitter, sampler, scene, si)
-        result = brdf_multiplier_accum * brdf_multiplier * L + result
+    emitter_sampling = True
 
-        # update
-        brdf_multiplier_accum = brdf_multiplier_accum * brdf_multiplier
+    m_max_depth = 4
+    for depth in range(m_max_depth):
+
+        si = scene.ray_intersect(ray, active=active)
+        if depth == 0:
+            pass
+        else:
+            # BSDF sampling
+            ds = mi.DirectionSample3f(scene, si, prev_si)
+            if emitter_sampling:
+                em_pdf = scene.pdf_emitter_direction(si, ds, active=active)
+            else:
+                em_pdf = mi.Float(0)
+            mis_bsdf = mis_weight(prev_bsdf_pdf.torch(), em_pdf.torch())[:, None]  # [N, 1]
+            L = emitter_eval(emitter, si)
+            L = torch.permute(L, (1, 0))  # [N, 3]
+            result = throughput * L * mis_bsdf + result  # [N, 3]
+
+        if depth == m_max_depth - 1:
+            break
+
+        active_next = si.is_valid()
+
+        if emitter_sampling:
+            # emitter sampling
+            # ds, em_weight = scene.sample_emitter_direction(si, sampler.next_2d(), True, active_next)
+            # em_weight = em_weight.torch()
+
+            ds, _ = scene.sample_emitter_direction(si, sampler.next_2d(), True, active_next)
+            # recompute em_weight (L/pdf)
+            ds.d = dr.normalize(ds.p - si.p)
+            ray2 = si.spawn_ray(ds.d)
+            si2 = scene.ray_intersect(ray2, active=active_next)
+            L = emitter_eval(emitter, si2)
+            L = torch.permute(L, (1, 0))  # [N, 3]
+            em_weight = L / ds.pdf.torch()[:, None]
+            em_weight = torch.where(ds.pdf.torch()[:, None] == 0, 0, em_weight)
+
+            wo = si.to_local(ds.d)
+            bsdf_val = bsdf.eval(si, wo, active=active)
+            bsdf_pdf = bsdf.pdf(si, wo, active=active)
+            bsdf_val = torch.where((bsdf_pdf == 0)[:, None], 0, bsdf_val)
+            mis_em = mis_weight(ds.pdf.torch(), bsdf_pdf)[:, None]  # [N, 1]
+            result = (throughput * bsdf_val * em_weight * mis_em + result)
+
+        sample1 = sampler.next_1d()
+        sample2 = sampler.next_2d()
+        bsdf_sample, bsdf_weight = bsdf.sample(si, sample1, sample2, active=active_next)
+
+        ray = si.spawn_ray(si.to_world(bsdf_sample.wo))
+
+        throughput = throughput * bsdf_weight  # [N, 3]
+        prev_si = si
+        prev_bsdf_pdf = bsdf_sample.pdf
+        active = active_next
 
     return result
-
-
-def cws(bsdf, emitter, sampler, scene, si):
-    sample1 = sampler.next_1d()
-    sample2 = sampler.next_2d()
-    wo_local, brdf_multiplier, pdf = bsdf.sample(si, sample1, sample2)
-    wo_world = si.sh_frame.to_world(wo_local)
-    #  Spawn incident rays
-    ray_o = si.spawn_ray(wo_world)
-    si2 = scene.ray_intersect(ray_o, active=si.is_valid())  # reject invalid ray_i
-    L = emitter.eval(si2, active=~si2.is_valid()).torch()
-    L = torch.clip(L, 0, None)
-    return L, brdf_multiplier, si2
 
 
 @dr.wrap_ad(source='torch', target='drjit')

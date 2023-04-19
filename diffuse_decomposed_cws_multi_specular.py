@@ -8,7 +8,7 @@ import json
 import math
 from path_tool import get_ply_path, get_light_probe_path, get_light_inten
 import matplotlib.pyplot as plt
-from bsdf_diffuse3 import BSDF_Diffuse, Diffuse_MLP_trivial, Diffuse_Model
+from bsdf_specular_cws import BSDF_Diffuse, Diffuse_MLP_trivial, Diffuse_Model, Alpha_MLP_trivial, Alpha_Model
 import copy
 
 mi.set_variant("cuda_ad_rgb")
@@ -57,14 +57,18 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
 
     diffuse_mlp = Diffuse_MLP_trivial()
     diffuse_model = Diffuse_Model(diffuse_mlp)
-    bsdf = BSDF_Diffuse(diffuse_model)
+
+    alpha_mlp = Alpha_MLP_trivial()
+    alpha_model = Alpha_Model(alpha_mlp)
+
+    bsdf = BSDF_Diffuse(diffuse_model, alpha_model)
 
     N_rays = dr.shape(ray.o)[1]
     result = torch.zeros((N_rays, 3), dtype=torch.float32, device='cuda')  # todo
     si = scene.ray_intersect(ray)
 
     brdf_multiplier_accum = 1
-    max_bounce = 3
+    max_bounce = 5
     for bounce in range(max_bounce):
         # cws
         L, brdf_multiplier, si = cws(bsdf, emitter, sampler, scene, si)
@@ -72,6 +76,8 @@ def render(cam_angle_x, cam_transform_mat, imh, imw, scene, spp, debug):
 
         # update
         brdf_multiplier_accum = brdf_multiplier_accum * brdf_multiplier
+
+        # print_result(result, spp)
 
     return result
 
@@ -145,9 +151,9 @@ def main():
     ply_path = get_ply_path(expeirment)
     envmap_path = get_light_probe_path(expeirment)
     inten = get_light_inten(expeirment)
-    # inten = 1
+    inten = 1
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
-    spp = 128
+    spp = 64
     debug = True
 
     if debug:

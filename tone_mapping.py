@@ -2,14 +2,12 @@ import torch
 import torchvision
 from pathlib import Path
 
-def linear2rgb(color):
-    srgb_exponent = 2.2  # blender gamma = 2.2
-    color = torch.clamp(color, 0, 1)
-    color = torch.pow(color, 1 / srgb_exponent)
-    return color
+def linear2srgb(f: torch.Tensor) -> torch.Tensor:
+    srgb = torch.where(f <= 0.0031308, f * 12.92, torch.pow(torch.clamp(f, 0.0031308), 1.0/2.4)*1.055 - 0.055)
+    return torch.clamp(srgb, 0, 1.0)
 
 
-def X2PIL(image, tone_mapping = True):
+def X2PIL(image, tone_mapping=True):
     if type(image) is not torch.Tensor:
         try: image = image.torch()
         except: print('image can not be converted into torch')
@@ -21,7 +19,9 @@ def X2PIL(image, tone_mapping = True):
         image = image.permute(2, 0, 1)
     """tone mapping"""
     if tone_mapping:
-        image = linear2rgb(image)
+        image = linear2srgb(image)
+    else:
+        image = torch.clamp(image, 0, 1.0)
     ToPILImage = torchvision.transforms.ToPILImage()
     image = ToPILImage(image)
     return image

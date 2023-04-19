@@ -33,7 +33,10 @@ def create_mitsuba_sensor(cam_transform_mat, cam_angle_x, imw, imh):
                    'fov': float(cam_angle_x * 180 / math.pi),
                    'film': {'type': 'hdrfilm',
                             'width': int(imw),
-                            'height': int(imh)},
+                            'height': int(imh),
+                            # # Use a box reconstruction filter
+                            # 'filter': {'type': 'box'}
+                            },
                    'sampler': {'type': 'independent',
                                'sample_count': 1
                                }

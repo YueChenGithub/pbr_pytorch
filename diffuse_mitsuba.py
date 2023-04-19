@@ -70,7 +70,7 @@ def main():
 
     scene = create_mitsuba_scene_envmap(ply_path, envmap_path, inten)
     global bounce
-    bounce = 5
+    bounce = 3
 
     for i in range(200):
         view = f"test_{i:03d}"
@@ -86,7 +86,9 @@ def main():
         """rendering"""
         image = render(cam_angle_x, cam_transform_mat, imh, imw, scene)
         save_image_path = f"./tests/diffuse_mitsuba/{expeirment}_bounce{bounce}/{view}.png"
-        save_image(image, save_image_path)
+        save_image(image, save_image_path, tone_mapping=True)
+
+
 
 
 if __name__ == '__main__':
